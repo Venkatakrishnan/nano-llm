@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from model import MinimalLLM
+from tokenizer import SimpleTokenizer
 
 # --- Hyperparameters ---
 batch_size = 32      # Number of sequences processed in parallel
@@ -24,24 +25,18 @@ else:
     device = torch.device("cpu")
     print("Using CPU")
 
-# --- Data Loading (Tiny Sample Corpus) ---
-# For a real run, you can point this to a text file like input.txt (e.g., TinyShakespeare)
+# --- Data Loading & Tokenization ---
 text = """
 The quick brown fox jumps over the lazy dog. 
 A minimal language model trained from scratch using PyTorch tensors, 
 attention mechanisms, and rotary position embeddings.
 """ * 100
 
-# Simple character-level tokenizer for demonstration
-chars = sorted(list(set(text)))
-vocab_size = len(chars)
-stoi = {ch: i for i, ch in enumerate(chars)}
-itos = {i: ch for i, ch in enumerate(chars)}
+tokenizer = SimpleTokenizer()
+tokenizer.train(text)
+vocab_size = tokenizer.vocab_size
 
-encode = lambda s: [stoi[c] for c in s]
-decode = lambda l: "".join([itos[i] for i in l])
-
-data = torch.tensor(encode(text), dtype=torch.long)
+data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
 n = int(0.9 * len(data))
 train_data = data[:n]
 val_data = data[n:]
