@@ -11,7 +11,7 @@ import torch
 from export_hf import export_hf, map_to_llama
 from model import MinimalLLM
 from tokenizer import HuggingFaceBpeTokenizer, SimpleTokenizer
-from train import main
+from train import encode_chat_examples, main
 
 
 class SimpleTokenizerTests(unittest.TestCase):
@@ -31,6 +31,29 @@ class SimpleTokenizerTests(unittest.TestCase):
 
 
 class MinimalLLMTests(unittest.TestCase):
+    def test_chat_encoder_masks_user_text_and_keeps_targets_in_short_windows(self):
+        tokenizer = SimpleTokenizer()
+        text = (
+            "Human: hidden prompt text that is longer than the context window.\n"
+            "Assistant: visible reply text should remain trainable.\n\n"
+        )
+        tokenizer.train(text, vocab_size=256)
+
+        inputs, targets = encode_chat_examples(text, tokenizer, block_size=48)
+        supervised_text = tokenizer.decode(targets[0][targets[0] != -100].tolist())
+        self.assertIn("Assistant:", supervised_text)
+        self.assertIn("visible", supervised_text)
+        self.assertNotIn("hidden prompt", supervised_text)
+
+        model = MinimalLLM(
+            vocab_size=tokenizer.vocab_size,
+            hidden_dim=16,
+            num_layers=1,
+            num_heads=4,
+        )
+        _, loss = model(inputs, targets)
+        self.assertTrue(torch.isfinite(loss).item())
+
     def test_forward_supports_documented_architecture_options(self):
         tokens = torch.randint(0, 300, (2, 6))
         targets = torch.randint(0, 300, (2, 6))
@@ -205,6 +228,51 @@ class LlamaExportTests(unittest.TestCase):
             )
             self.assertTrue((export_dir / "tokenizer.json").is_file())
 
+    @unittest.skipUnless(importlib.util.find_spec("transformers"), "Transformers is optional.")
+    def test_exported_tokenizer_has_no_out_of_range_default_unknown_token(self):
+        from transformers import AutoTokenizer
+
+        text = "A tokenizer compatibility test. " * 10
+        tokenizer = HuggingFaceBpeTokenizer()
+        tokenizer.train(text, vocab_size=300)
+        model = MinimalLLM(
+            vocab_size=tokenizer.vocab_size,
+            hidden_dim=16,
+            num_layers=1,
+            num_heads=4,
+            use_rope=True,
+            norm_type="rmsnorm",
+            mlp_type="swiglu",
+        )
+        checkpoint = {
+            "model_state_dict": model.state_dict(),
+            "config": {
+                "vocab_size": tokenizer.vocab_size,
+                "hidden_dim": 16,
+                "num_layers": 1,
+                "num_heads": 4,
+                "block_size": 8,
+                "use_rope": True,
+                "norm_type": "rmsnorm",
+                "mlp_type": "swiglu",
+                "tokenizer_format": "gpt2",
+                "bos_token_id": tokenizer.bos_id,
+                "eos_token_id": tokenizer.eos_id,
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint_path = root / "checkpoint.pt"
+            tokenizer_path = root / "tokenizer.json"
+            export_dir = root / "hf-model"
+            torch.save(checkpoint, checkpoint_path)
+            tokenizer.save(tokenizer_path)
+            export_hf(checkpoint_path, tokenizer_path, export_dir)
+
+            exported_tokenizer = AutoTokenizer.from_pretrained(export_dir, local_files_only=True)
+            self.assertLess(max(exported_tokenizer.get_vocab().values()), tokenizer.vocab_size)
+
     def test_training_can_export_llama_model_end_to_end(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -245,6 +313,64 @@ class LlamaExportTests(unittest.TestCase):
             self.assertTrue((export_dir / "config.json").is_file())
             self.assertTrue((export_dir / "pytorch_model.bin").is_file())
             self.assertTrue((export_dir / "tokenizer.json").is_file())
+
+    def test_training_reuses_existing_gpt2_tokenizer(self):
+        from tokenizers import Tokenizer
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_tokenizer_path = root / "frozen-tokenizer.json"
+            training_text_path = root / "new-training-text.txt"
+            checkpoint = root / "model.pt"
+
+            tokenizer = HuggingFaceBpeTokenizer()
+            tokenizer.train("Tokenizer vocabulary from an earlier corpus. " * 20, vocab_size=300)
+            tokenizer.save(source_tokenizer_path)
+            training_text_path.write_text(
+                "Human: A different prompt reuses the saved token IDs.\n"
+                "Assistant: This reply is trained with the existing vocabulary.\n\n" * 20,
+                encoding="utf-8",
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                main(
+                    [
+                        "--text-file",
+                        str(training_text_path),
+                        "--tokenizer-format",
+                        "gpt2",
+                        "--tokenizer-file",
+                        str(source_tokenizer_path),
+                        "--device",
+                        "cpu",
+                        "--steps",
+                        "1",
+                        "--eval-interval",
+                        "1",
+                        "--batch-size",
+                        "2",
+                        "--block-size",
+                        "8",
+                        "--hidden-dim",
+                        "16",
+                        "--layers",
+                        "1",
+                        "--heads",
+                        "4",
+                        "--generation-tokens",
+                        "2",
+                        "--output",
+                        str(checkpoint),
+                    ]
+                )
+
+            checkpoint_data = torch.load(checkpoint, map_location="cpu", weights_only=True)
+            self.assertEqual(checkpoint_data["config"]["vocab_size"], tokenizer.vocab_size)
+            reused_tokenizer = Tokenizer.from_file(str(checkpoint.with_suffix(".pt.tokenizer.json")))
+            self.assertEqual(
+                reused_tokenizer.get_vocab(),
+                Tokenizer.from_file(str(source_tokenizer_path)).get_vocab(),
+            )
 
 
 if __name__ == "__main__":

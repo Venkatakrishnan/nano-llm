@@ -121,6 +121,7 @@ def export_hf(checkpoint_path, tokenizer_path, output_dir):
         "model_max_length": hf_config["max_position_embeddings"],
         "bos_token": tokenizer.bos_token,
         "eos_token": tokenizer.eos_token,
+        "unk_token": tokenizer.bos_token,
         "add_bos_token": False,
         "add_eos_token": False,
         "clean_up_tokenization_spaces": False,

@@ -9,10 +9,10 @@ from tokenizer import HuggingFaceBpeTokenizer, SimpleTokenizer
 
 
 SAMPLE_TEXT = (
-    "The quick brown fox jumps over the lazy dog. "
-    "A minimal language model trained from scratch using PyTorch tensors, "
-    "attention mechanisms, and rotary position embeddings.\n"
-) * 100
+    "Human: What is a minimal language model?\n"
+    "Assistant: A minimal language model trained from scratch using PyTorch tensors, "
+    "attention mechanisms, and rotary position embeddings.\n\n"
+) * 50
 
 
 def parse_args(argv=None):
@@ -23,17 +23,21 @@ def parse_args(argv=None):
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--eval-interval", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--block-size", type=int, default=64)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--hidden-dim", type=int, default=128)
-    parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--block-size", type=int, default=256)
+    parser.add_argument("--learning-rate", type=float, default=4e-4)
+    parser.add_argument("--hidden-dim", type=int, default=192)
+    parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--heads", type=int, default=4)
-    parser.add_argument("--vocab-size", type=int, default=512)
+    parser.add_argument("--vocab-size", type=int, default=1024)
     parser.add_argument(
         "--tokenizer-format",
         choices=("bpe", "gpt2"),
         default="bpe",
         help="Use GPT-2-compatible byte-level BPE for llama.cpp GGUF export.",
+    )
+    parser.add_argument(
+        "--tokenizer-file",
+        help="Load this existing tokenizer JSON instead of training a new tokenizer.",
     )
     parser.add_argument(
         "--export-hf",
@@ -43,6 +47,11 @@ def parse_args(argv=None):
     parser.add_argument("--mlp", choices=("swiglu", "mlp"), default="swiglu")
     parser.add_argument("--no-rope", action="store_true", help="Disable rotary position embeddings.")
     parser.add_argument("--generation-tokens", type=int, default=100)
+    parser.add_argument(
+        "--no-mask-human",
+        action="store_true",
+        help="Disable -100 loss masking on Human: prompt tokens (train on full text stream).",
+    )
     return parser.parse_args(argv)
 
 
@@ -72,11 +81,85 @@ def select_device(requested):
         )
 
 
-def get_batch(data, batch_size, block_size, device):
-    starts = torch.randint(len(data) - block_size, (batch_size,))
-    inputs = torch.stack([data[start : start + block_size] for start in starts])
-    targets = torch.stack([data[start + 1 : start + block_size + 1] for start in starts])
-    return inputs.to(device), targets.to(device)
+def _encode_raw(tokenizer, segment):
+    """Encode a text segment without inserting extra BOS tokens mid-dialogue."""
+    if isinstance(tokenizer, HuggingFaceBpeTokenizer):
+        return tokenizer.tokenizer.encode(segment, add_special_tokens=False).ids
+    return tokenizer.encode(segment)
+
+
+def encode_chat_examples(text, tokenizer, block_size, mask_human=True):
+    """
+    Splits dialogue blocks on blank lines, masks Human: targets with -100, and
+    pads each context window to block_size + 1. Long blocks are cropped around
+    their first supervised target so a short prompt cannot mask the whole window.
+    """
+    blocks = [b.strip() for b in text.strip().split("\n\n") if b.strip()]
+    all_inputs, all_targets = [], []
+
+    for block in blocks:
+        # Skip standalone markdown section headers that have no dialogue turns
+        if "Assistant:" not in block:
+            continue
+
+        lines = block.splitlines(keepends=True)
+        input_ids = [tokenizer.bos_id] if isinstance(tokenizer, HuggingFaceBpeTokenizer) else []
+        target_ids = [-100] * len(input_ids)
+
+        is_assistant = False
+        for line in lines:
+            if line.startswith("Human:"):
+                is_assistant = False
+            elif line.startswith("Assistant:"):
+                is_assistant = True
+
+            ids = _encode_raw(tokenizer, line)
+            input_ids.extend(ids)
+
+            if is_assistant or not mask_human:
+                target_ids.extend(ids)
+            else:
+                target_ids.extend([-100] * len(ids))
+
+        # Append EOS at the end of the dialogue so the model learns when to stop
+        if isinstance(tokenizer, HuggingFaceBpeTokenizer):
+            input_ids.append(tokenizer.eos_id)
+            target_ids.append(tokenizer.eos_id)
+
+        max_length = block_size + 1
+        valid_target_positions = [
+            index
+            for index, target in enumerate(target_ids[1:], start=1)
+            if target != -100
+        ]
+        if not valid_target_positions:
+            raise ValueError("Dialogue block has no supervised target tokens.")
+
+        if len(input_ids) > max_length:
+            first_target = valid_target_positions[0]
+            start = max(0, first_target - block_size // 2)
+            start = min(start, len(input_ids) - max_length)
+            end = start + max_length
+            input_ids = input_ids[start:end]
+            target_ids = target_ids[start:end]
+        else:
+            pad_len = max_length - len(input_ids)
+            pad_id = tokenizer.eos_id if isinstance(tokenizer, HuggingFaceBpeTokenizer) else 0
+            input_ids.extend([pad_id] * pad_len)
+            target_ids.extend([-100] * pad_len)
+
+        all_inputs.append(input_ids[:-1])
+        all_targets.append(target_ids[1:])
+
+    if not all_inputs:
+        raise ValueError("No valid 'Human:' / 'Assistant:' dialogue blocks found in training text.")
+
+    return torch.tensor(all_inputs, dtype=torch.long), torch.tensor(all_targets, dtype=torch.long)
+
+
+def get_batch(inputs_all, targets_all, batch_size, device):
+    indices = torch.randint(len(inputs_all), (batch_size,))
+    return inputs_all[indices].to(device), targets_all[indices].to(device)
 
 
 def main(argv=None):
@@ -102,19 +185,30 @@ def main(argv=None):
     text = Path(args.text_file).read_text(encoding="utf-8") if args.text_file else SAMPLE_TEXT
     if args.tokenizer_format == "gpt2":
         tokenizer = HuggingFaceBpeTokenizer()
-        tokenizer.train(text, vocab_size=args.vocab_size)
     else:
         tokenizer = SimpleTokenizer()
+    if args.tokenizer_file:
+        tokenizer.load(args.tokenizer_file)
+    else:
         tokenizer.train(text, vocab_size=args.vocab_size)
 
-    token_ids = tokenizer.encode(text)
-    if isinstance(tokenizer, HuggingFaceBpeTokenizer):
-        token_ids.append(tokenizer.eos_id)
-    data = torch.tensor(token_ids, dtype=torch.long)
-    split_at = int(0.9 * len(data))
-    train_data, val_data = data[:split_at], data[split_at:]
-    if len(train_data) <= args.block_size or len(val_data) <= args.block_size:
-        raise ValueError("Training text is too short for the selected block-size.")
+    inputs_all, targets_all = encode_chat_examples(
+        text,
+        tokenizer,
+        args.block_size,
+        mask_human=not args.no_mask_human,
+    )
+    split_at = int(0.9 * len(inputs_all))
+    train_x, train_y = inputs_all[:split_at], targets_all[:split_at]
+    val_x, val_y = inputs_all[split_at:], targets_all[split_at:]
+    if len(train_x) == 0 or len(val_x) == 0:
+        raise ValueError("Not enough dialogue blocks for a 90/10 train/validation split.")
+
+    print(
+        f"Loaded {len(inputs_all)} dialogue blocks "
+        f"({len(train_x)} train / {len(val_x)} validation); "
+        f"assistant-only loss masking: {not args.no_mask_human}."
+    )
 
     model = MinimalLLM(
         vocab_size=tokenizer.vocab_size,
@@ -133,37 +227,48 @@ def main(argv=None):
         model.eval()
         losses = {}
         with torch.no_grad():
-            for name, split in (("train", train_data), ("validation", val_data)):
-                batch_losses = [
-                    model(*get_batch(split, args.batch_size, args.block_size, device))[1].item()
-                    for _ in range(5)
-                ]
-                losses[name] = sum(batch_losses) / len(batch_losses)
+            for name, (split_x, split_y) in (("train", (train_x, train_y)), ("validation", (val_x, val_y))):
+                total_loss = 0.0
+                total_tokens = 0
+                for start in range(0, len(split_x), args.batch_size):
+                    inputs = split_x[start : start + args.batch_size].to(device)
+                    targets = split_y[start : start + args.batch_size].to(device)
+                    _, batch_loss = model(inputs, targets)
+                    token_count = (targets != -100).sum().item()
+                    total_loss += batch_loss.item() * token_count
+                    total_tokens += token_count
+                if total_tokens == 0:
+                    raise ValueError(f"{name} split has no supervised target tokens.")
+                losses[name] = total_loss / total_tokens
         model.train()
         return losses
 
     model.train()
     for step in range(args.steps):
-        inputs, targets = get_batch(train_data, args.batch_size, args.block_size, device)
+        inputs, targets = get_batch(train_x, train_y, args.batch_size, device)
         _, loss = model(inputs, targets)
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
-        if step % args.eval_interval == 0 or step == args.steps - 1:
+        completed_steps = step + 1
+        if completed_steps % args.eval_interval == 0 or completed_steps == args.steps:
             losses = estimate_losses()
             print(
-                f"Step {step + 1:4d} | "
+                f"Step {completed_steps:4d} | "
                 f"train {losses['train']:.4f} | validation {losses['validation']:.4f}"
             )
-
-    context = torch.tensor([tokenizer.encode("The")], dtype=torch.long, device=device)
+    prompt_text = "Human: What is a budget for?\nAssistant: "
+    context = torch.tensor([tokenizer.encode(prompt_text)], dtype=torch.long, device=device)
+    eos_id = tokenizer.eos_id if isinstance(tokenizer, HuggingFaceBpeTokenizer) else None
     model.eval()
     with torch.no_grad():
         for _ in range(args.generation_tokens):
             logits, _ = model(context[:, -args.block_size :])
-            probabilities = torch.softmax(logits[:, -1, :], dim=-1)
+            probabilities = torch.softmax(logits[:, -1, :] / 0.3, dim=-1)
             next_token = torch.multinomial(probabilities, num_samples=1)
+            if eos_id is not None and next_token.item() == eos_id:
+                break
             context = torch.cat((context, next_token), dim=1)
 
     output_path = Path(args.output)

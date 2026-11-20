@@ -28,7 +28,10 @@ share/python-wheels/
 MANIFEST
 *.pt
 *.pt*
-llama-hf/*
+*.gguf
+*-hf/*
+Modelfile
+nano*
 
 # PyInstaller
 #   Usually these files are written by a python script from a template
